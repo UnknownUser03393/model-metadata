@@ -3,10 +3,19 @@
 # produce spurious diffs.
 * text=auto eol=lf
 
-# Explicit: the shipped database and the UTF-16LE test fixture must never be treated as
-# text. Git's NUL-byte sniffing already classifies both as binary, but relying on a
-# heuristic for a committed artifact is not worth the risk.
-*.db     binary
-*.db-journal binary
-*.db-wal binary
-*.db-shm binary
+# Binary files are pinned explicitly rather than left to git's NUL-byte sniffing. A
+# committed artifact or a UTF-16 fixture should not depend on a heuristic: if any tool
+# decides such a file is text, eol conversion silently corrupts it.
+#
+# `binary` is git's macro for `-text -diff`. The .sqlite/.sqlite3 patterns are here
+# because `modelmeta update --out` accepts an arbitrary path.
+*.db             binary
+*.sqlite         binary
+*.sqlite3        binary
+*.db-journal     binary
+*.db-wal         binary
+*.db-shm         binary
+
+# UTF-16LE with a BOM. A text file in intent, but its bytes are not UTF-8 text, so it
+# must never be subject to line-ending conversion.
+tests/fixtures/mini_utf16.json binary

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Launcher so `modelmeta <command>` works with bin/ on PATH, with nothing installed.
+#
+# This file lives in bin/ rather than the repo root because a file named `modelmeta`
+# would collide with the `modelmeta/` package directory.
+#
+# The database is looked up by the normal `modelmeta.db` relative rule. If it is not
+# where you are, the read commands fail loudly instead of silently creating an empty
+# database (they open read-only with mode=ro, which errors on a missing file).
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+# An interpreter is accepted only if it actually prints the sentinel. On Windows,
+# `python3` commonly resolves to a Microsoft Store alias stub that prints a "not found"
+# message AND EXITS 0, so neither `command -v` nor the exit status can be trusted.
+probe() {
+    [ "$("$1" -c 'print("mm_ok")' 2>/dev/null)" = "mm_ok" ]
+}
+
+for candidate in "${PYTHON:-}" python3 python py; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if probe "$candidate"; then
+        exec "$candidate" -m modelmeta "$@"
+    fi
+done
+
+echo "modelmeta: no working python interpreter found (tried \$PYTHON, python3, python, py)" >&2
+exit 127

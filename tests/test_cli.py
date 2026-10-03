@@ -142,6 +142,32 @@ class TestCli(unittest.TestCase):
         self.assertIn("string similarity", out)
 
 
+class TestMissingDatabase(unittest.TestCase):
+    """A launcher on PATH makes "wrong working directory" easy to hit.
+
+    The database must fail to open rather than be created empty: an empty database is how
+    a metadata query returns a confident wrong answer.
+    """
+
+    def test_read_commands_report_a_missing_database_without_creating_it(self):
+        path = os.path.join(tempfile.gettempdir(), "modelmeta-absent-xyz.db")
+        if os.path.exists(path):
+            os.unlink(path)
+        try:
+            for argv in (["get", "x"], ["search", "--vision"], ["rules"], ["sources"],
+                         ["diff", "x"]):
+                with self.subTest(command=argv[0]):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        code, _ = run(*argv, "--db", path)
+                    self.assertEqual(code, 2)
+                    self.assertIn("database not found", err.getvalue())
+            self.assertFalse(os.path.exists(path), "must not create an empty database")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
 class TestUpdateGuard(unittest.TestCase):
     def test_update_rejects_a_wrong_format_snapshot_without_writing(self):
         bad = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")

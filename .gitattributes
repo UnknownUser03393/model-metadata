@@ -3,6 +3,13 @@
 # produce spurious diffs.
 * text=auto eol=lf
 
+# Windows batch files are the one text format that must keep CRLF: cmd.exe can mis-parse
+# LF-only .cmd/.bat files (notably around labels, goto and caret line continuation). The
+# launcher has none of those today, but a fresh clone handing out an LF .cmd is a trap
+# waiting for the first person to add one.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # Binary files are pinned explicitly rather than left to git's NUL-byte sniffing. A
 # committed artifact or a UTF-16 fixture should not depend on a heuristic: if any tool
 # decides such a file is text, eol conversion silently corrupts it.

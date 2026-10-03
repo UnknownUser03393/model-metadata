@@ -14,6 +14,7 @@ for a large part of this catalogue.
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
 from . import schema as S
@@ -47,6 +48,23 @@ def tri(value):
 
 def money(value):
     return "unknown" if value is None else f"${value:g}"
+
+
+def _open_ro(args):
+    """Open the database read-only, with a message instead of a traceback when it is absent.
+
+    A launcher on PATH makes "wrong working directory" easy to hit, and sqlite3's own
+    error for a missing file ("unable to open database file") does not say which file or
+    what to do about it. Note it FAILS rather than creating an empty database -- a silent
+    empty database is how a metadata query returns a confident wrong answer.
+    """
+    try:
+        return Q.connect(args.db, read_only=True)
+    except sqlite3.OperationalError:
+        print(f"database not found: {args.db}", file=sys.stderr)
+        print("run from the repository root, or pass --db PATH after the subcommand "
+              "(e.g. `modelmeta get X --db /path/to/modelmeta.db`)", file=sys.stderr)
+        return None
 
 
 def _emit(payload, as_json, lines):
@@ -100,7 +118,9 @@ def cmd_update(args):
 
 
 def cmd_get(args):
-    conn = Q.connect(args.db, read_only=True)
+    conn = _open_ro(args)
+    if conn is None:
+        return 2
     model = Q.resolve_model(conn, args.model)
     if model is None:
         conn.close()
@@ -266,7 +286,9 @@ def _offering_payload(conn, off, include_evidence):
 
 
 def cmd_search(args):
-    conn = Q.connect(args.db, read_only=True)
+    conn = _open_ro(args)
+    if conn is None:
+        return 2
 
     sql = [
         "SELECT o.*, m.catalog_id, m.name AS model_name, m.author "
@@ -382,7 +404,9 @@ def cmd_search(args):
 
 
 def cmd_diff(args):
-    conn = Q.connect(args.db, read_only=True)
+    conn = _open_ro(args)
+    if conn is None:
+        return 2
     model = Q.resolve_model(conn, args.model)
     if model is None:
         conn.close()
@@ -468,7 +492,9 @@ def cmd_verify(args):
 
 
 def cmd_sources(args):
-    conn = Q.connect(args.db, read_only=True)
+    conn = _open_ro(args)
+    if conn is None:
+        return 2
     rows = conn.execute(
         "SELECT s.id, s.kind, s.url, s.live_http_status, "
         "  (SELECT COUNT(*) FROM offering o WHERE o.source_id = s.id) AS offerings "
@@ -489,7 +515,9 @@ def cmd_sources(args):
 
 
 def cmd_rules(args):
-    conn = Q.connect(args.db, read_only=True)
+    conn = _open_ro(args)
+    if conn is None:
+        return 2
     lines = ["the snapshot's own normalization contract, quoted from the source:"]
     for r in Q.normalization_rules(conn):
         lines.append("")

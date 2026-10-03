@@ -53,6 +53,28 @@ conn = sqlite3.connect("modelmeta.db")
 conn.row_factory = sqlite3.Row
 ```
 
+### Invoking the CLI
+
+Either `python -m modelmeta <command>`, or put `bin/` on PATH once and drop the prefix:
+
+```bash
+export PATH="$PWD/bin:$PATH"     # bash
+setx PATH "%PATH%;%CD%\bin"      # cmd, once
+modelmeta get deepseek/deepseek-v4.1-flash
+```
+
+`bin/` rather than the repo root because a file named `modelmeta` cannot coexist with the
+`modelmeta/` package directory. There is deliberately no `pyproject.toml` and no install
+step — the launchers add the repo to `PYTHONPATH` and nothing else.
+
+They accept an interpreter only after proving it works, because on Windows `python3`
+commonly resolves to a Microsoft Store alias stub that prints "Python was not found" **and
+exits 0** — so neither `command -v` nor the exit status identifies a usable interpreter.
+
+`--db` is a per-subcommand option, so it goes after the command:
+`modelmeta get X --db /path/to/modelmeta.db`. If the database is missing, read commands
+fail with an explanatory message rather than creating an empty one.
+
 Contents: 651 models, 696 offerings (647 aggregator + 49 provider-official), 9,093
 capability rows, 2,616 prices, 35 offerings with an expiry date, 2 recorded conflicts,
 2.3 MB.

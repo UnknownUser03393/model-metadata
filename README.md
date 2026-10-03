@@ -2,34 +2,41 @@
 
 A codebase for harness/app to fetch the model metadatas.
 
-Ships as a single SQLite file, `modelmeta.db`, built from LiteLLM's
-[`model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json).
-Clone the repo and query it — no ingest step, no JSON parsing, no runtime dependency on
-LiteLLM being up.
+Ships as a single SQLite file, `modelmeta.db`, mirrored from a curated snapshot
+(`snapshot/model_metainf_2026-10-03.json`). Clone the repo and query it — no build step,
+no JSON parsing, no runtime dependency.
 
-The DB *is* the interface. Nothing in it is Python-specific, so a TypeScript, Go or Rust
-consumer reads it with that language's SQLite driver. Python is only used to build it.
+The database *is* the interface. Nothing in it is Python-specific, so a TypeScript, Go or
+Rust consumer reads it with that language's SQLite driver. Python is only used to build it.
+
+## Read this first: nothing here has been verified against a running model
+
+Every one of the 696 offerings has `inference_tested = 0`, and the snapshot's own
+`statistics.inference_calls_performed` is `0`. **No inference call was ever made.** Every
+statement in this database — every capability, every limit, every price — means "a catalog
+or a provider's documentation states this", never "we measured this".
+
+A `vision = true` row means a catalogue listed `vision` among the modalities. It does not
+mean anyone sent an image to that model. The `unverified` view exists so this cannot be
+lost, and `modelmeta sources` shows which sources were even reachable: only 1 of 12 was
+ever HTTP-probed (`live_http_status` is NULL for the rest, which means "not checked", not
+"failed").
 
 ## Why not just read the JSON
 
-Reading upstream directly is workable until you need a non-obvious answer:
+Reading the snapshot directly is workable until you need a non-obvious answer:
 
-- **62% of the payload is pricing** (137 of 219 distinct fields). Field names are not
-  uniform — most are `<x>_cost_per_<unit>`, cache pricing instead uses `<x>_token_cost`,
-  and markers stack in either order (`..._token_cost_above_1hr_above_200k_tokens`).
-- **The natural names are wrong.** There is no `supports_tools`, no
-  `supports_structured_output`. The real fields are `supports_function_calling` +
-  `supports_tool_choice`, and `supports_response_schema` + `supports_native_structured_output`.
-- **Absent means unknown, not false.** Only 2212 of 4460 entries mention
-  `supports_vision`: 1755 true, 457 false, **2248 silent**. Anything that defaults a
-  missing capability to `false` is wrong about half the dataset.
-- **One fact is encoded two ways.** Reasoning-effort support is either five discrete
-  booleans (`supports_xhigh_reasoning_effort`, …) or a list (`reasoning_effort_levels`).
-  No entry uses both, so a query for "supports reasoning at level X" misses one group
-  unless you merge them.
-- **Some models have no flat price at all.** `dashscope/qwen-flash` has no
-  `input_cost_per_token`; it is priced only by a `tiered_pricing` band list. A naive
-  `SELECT` returns nothing useful for it.
+- **The unit of truth is an offering, not a model.** The same model served by two
+  providers has different limits and prices, and the snapshot retains both. `get` shows
+  them side by side; `conflicts` records where they disagree.
+- **Two structurally different kinds of tri-state exist in the same object.** Six
+  capabilities are declared modalities and are only ever `true`/`false`. Six others are
+  inferred from the presence of a supported parameter and are only ever `true`/`null` —
+  `false` never occurs. Two more (`parallel_tool_calls`, `streaming`) are declared and
+  never established. Treating `null` as `false` is wrong about a third of the catalogue.
+- **Some values are deliberately weird and must stay that way.** 73 offerings report
+  `context_tokens = 0`. Five columns are 100% NULL. The snapshot's own rules say not to
+  guess; this database does not repair any of it.
 
 ## Quick start
 
@@ -37,7 +44,7 @@ Reading upstream directly is workable until you need a non-obvious answer:
 git clone https://github.com/UnknownUser03393/model-metadata
 cd model-metadata
 
-sqlite3 modelmeta.db "SELECT key FROM model WHERE mode='chat' LIMIT 5"
+sqlite3 modelmeta.db "SELECT catalog_id, authority, provider FROM offering LIMIT 5"
 ```
 
 ```python
@@ -46,137 +53,159 @@ conn = sqlite3.connect("modelmeta.db")
 conn.row_factory = sqlite3.Row
 ```
 
-## The one access path you must use for pricing
+Contents: 651 models, 696 offerings (647 aggregator + 49 provider-official), 9,093
+capability rows, 2,616 prices, 35 offerings with an expiry date, 2 recorded conflicts,
+2.3 MB.
 
-Banded pricing cannot be read with a plain `SELECT`. The supported rule is **the band
-with the largest `band_start` that is still ≤ your token count**, and it is shipped as
-SQL so nobody has to reimplement it:
-
-```sql
-SELECT p.price
-FROM price p JOIN source s ON s.id = p.source_id
-WHERE p.model_id = :model_id
-  AND p.direction = 'input'
-  AND p.unit = 'per_token'
-  AND (p.band_start IS NULL OR p.band_start <= :n_tokens)
-  AND p.tier IS NULL AND p.modality IS NULL AND p.cache_ttl IS NULL
-  AND (p.qualifier IS NULL OR p.qualifier NOT LIKE '%scaled%')
-ORDER BY s.priority DESC, (p.band_start IS NULL), p.band_start DESC
-LIMIT 1
-```
-
-The Python API exposes it as a scalar function of the same name:
-
-```python
-from modelmeta import query
-conn = query.connect("modelmeta.db", read_only=True)
-conn.execute("SELECT price_at(?, 'input', 300000)", (model_id,)).fetchone()[0]
-```
-
-This rule covers both shapes in the data: a flat price is `band_start = 0`, and the
-`_above_200k_tokens` family are surcharge bands in the same slot. Tiered schedules are
-decomposed into real bands at ingest time, so `price_at` works for those models too
-(their raw JSON is still in `price_schedule` as the authority on band edges).
-
-## Capabilities are tri-state
+## Capabilities are tri-state, and the kind matters
 
 ```sql
--- supported
-SELECT 1 FROM resolved_fact WHERE model_id = ? AND field = 'supports_vision' AND v_bool = 1;
--- unsupported
-SELECT 1 FROM resolved_fact WHERE model_id = ? AND field = 'supports_vision' AND v_bool = 0;
--- unknown: no row. Do not treat this as unsupported.
+-- yes
+SELECT 1 FROM capability WHERE offering_id = ? AND name = 'vision' AND value = 1;
+-- no, and this is a real observation
+SELECT 1 FROM capability WHERE offering_id = ? AND name = 'vision' AND value = 0;
+-- unknown: no row, or a row whose value is NULL. Not "no".
 ```
 
-`modelmeta search --vision` compiles to the first form, so models that are silent about
-vision are excluded rather than assumed false.
+`capability_def` says, per capability, whether `false` is even possible:
+
+| domain | capabilities | `false` means | distribution in this snapshot |
+|---|---|---|---|
+| `modality` | `vision`, `audio_input`, `video_input`, `image_output`, `audio_output`, `embeddings` | the declared modality list does not include it | `vision` 387 true / 273 false / **0 unknown** |
+| `parameter` | `tool_calling`, `structured_outputs`, `json_mode`, `temperature`, `reasoning`, `prompt_cache` | *(cannot occur)* | `tool_calling` 408 true / **249 unknown** / **0 false** |
+| `operational` | `parallel_tool_calls`, `streaming` | *(cannot occur)* | declared on 647 offerings, **established on none** |
+
+That distinction is not decoration. It is why these two searches return different things:
+
+```bash
+python -m modelmeta search --no-vision    # 273 offerings: false is a declared observation
+python -m modelmeta search --no-tools     # 0 offerings:  tool_calling can never be false
+```
+
+The second is not a bug. Returning every offering whose `tool_calling` is `null` would be
+the bug — it would silently assert that 249 offerings *lack* a capability that simply was
+not established.
+
+`model_capability` aggregates over offerings for questions about the model itself, and
+still says NULL when no offering established anything.
 
 ## CLI
 
-```bash
-python -m modelmeta get dashscope/qwen-flash          # facts, efforts, banded prices
-python -m modelmeta get sora-2 --json                 # resolves through aliases
-python -m modelmeta search --vision --tools --mode chat --max-input-price 1e-06
-python -m modelmeta diff <model> --field supports_vision
-python -m modelmeta sources                           # precedence table
-python -m modelmeta verify                            # completeness + consistency
+```
+python -m modelmeta get    CATALOG_ID [--evidence] [--json]
+python -m modelmeta search [--vision] [--no-tools] [--text-only] [--min-context N]
+                           [--max-input-price USD_PER_M] [--author] [--provider]
+                           [--status] [--expiring-before YYYY-MM-DD] [--json]
+python -m modelmeta diff   CATALOG_ID [--json]
+python -m modelmeta rules                  # the snapshot's own normalization contract
+python -m modelmeta sources                # 12 sources, which were probed
+python -m modelmeta verify                 # completeness + consistency
+python -m modelmeta update --from-file snapshot/...json
 ```
 
-`search` flags expand to the real upstream field names — `--tools` is
-`supports_function_calling`, not an invented `supports_tools`. Nothing is OR-ed together
-on your behalf.
+`get` shows the model's aggregated capabilities, then each offering in full — availability,
+limits, modalities, per-capability tri-state with `(false cannot occur)` annotations,
+reasoning efforts, and prices — then any recorded conflicts.
 
-`diff` reads the raw `fact` table rather than the resolved view, so it shows losing
-values as well as winning ones.
+`search` returns **offerings**, because the conditions are offering-level. Capability flags
+come in both polarities (`--vision` / `--no-vision`), generated from `capability_def`.
+`--max-input-price` compares against the cheapest advertised input rate per million tokens,
+off-peak included.
 
-## Schema
+## Prices
 
-| Table | Contents |
-|---|---|
-| `model` | one row per source entry (4460), including 2 flagged `is_doc_entry` placeholders |
-| `fact` | the lossless spine: typed `v_bool`/`v_num`/`v_text`/`v_json`, `raw_field` preserved |
-| `price` | `direction × unit × modality × tier × cache_ttl`, token `band_start`/`band_end` |
-| `price_schedule` | price structures that cannot be flattened, as JSON |
-| `reasoning_effort` | both encodings merged into one level-per-model table |
-| `model_alias` | spelling variants only |
-| `provider_offer` | one model family sold through different providers |
-| `raw_record` | verbatim source record (round-trip proof; omit with `--no-raw`) |
-| `source_field_freshness` | per-field `first_seen` / `last_seen` / `last_changed` |
-| `ingest_issue` | every drop / coercion / collision / unclassified field |
-| `resolved_fact` | **VIEW** — winner per `(model, field)` by source priority |
+Per **million** tokens, USD, from `pricing.token_unit = 1000000`. 657 offerings carry
+prices; 39 carry none at all (mostly provider-official entries).
 
-Current contents: 49,429 facts, 15,480 prices, 4460 raw records, 36 aliases, 16.4 MB.
+Two offerings price by time of day rather than a flat rate. Those use `time_band`
+(`peak` / `off_peak`) and appear as separate rows:
 
-Derived facts carry `is_derived = 1`: `context_window` comes from `max_input_tokens` (or
-from `max_tokens` for embedding/rerank/ocr modes, where it is the input capacity, not an
-output length). Raw inputs are always kept alongside, so every derivation is auditable.
+```
+[off_peak] input   $0.15
+[peak]     input   $0.3
+```
 
-## Provenance and priority
+The original published strings are kept verbatim in `price_raw` (`{"prompt": "0.0000003"}`),
+and `price_note` carries the snapshot's own warning about non-token prices. There are no
+token-count bands in this dataset, so unlike the previous iteration there is no
+`price_at()` band-resolution function to get wrong.
 
-Resolution order is `local_override (100) > provider_official (80) > openrouter (60) >
-litellm (40)`. `resolved_fact` recomputes the winner on read from the `fact` table, which
-is the only source of truth — there is no second copy to drift out of sync, and losers
-are retained so `diff` can report disagreement.
+## Provenance
 
-**Only the `litellm` source has a loader today.** The other three rows exist so the
-resolver, `diff` and the freshness tables are already correct, but `diff` cannot show
-cross-source disagreement until a second loader is written. `modelmeta sources` says so
-too.
+Resolution is not collapsed: `offering.source_id` names the source each offering came from,
+`conflict` retains both sides of every disagreement, and `capability_evidence` holds the
+snapshot's own explanation of how each capability group was determined. `normalization_rule`
+stores the snapshot's data contract verbatim — six rules, including the two this schema is
+built around:
+
+> **null**: Unknown, unreported, or not independently established. Never coerce absent
+> supported parameter to false.
+>
+> **identity**: `catalog_id` is an offering/catalog identity; `canonical_slug` is source
+> declared, not global deduplication proof. Do not merge aliases/quantizations/free/batch
+> variants by string similarity.
+
+The second is why there is no alias table and no fuzzy model lookup. `get` resolves
+`catalog_id`, then `canonical_slug`, then display name — exact matches only.
+
+Availability status is not binary either: `listed` 647, `documented_available` 36,
+`existing_users_only` 8, `retired` 4, `plan_restricted` 1.
+
+## Known data quirks, preserved on purpose
+
+| Quirk | Count | What this database does |
+|---|---|---|
+| `context_tokens = 0` (and `max_output_tokens = 0`) | 73 | stores 0. Does not guess that 0 means unknown. `get` annotates it. |
+| `max_input_tokens` | 696 of 696 NULL | the column is unused upstream; kept so it is visibly empty |
+| `release_date`, `open_weights`, `license`, `parameter_count` | 100% NULL | the snapshot declines to assert these; so does the mirror |
+| near-miss limits (`8191`, `4095`, `16385`, `1048756`) | — | stored as published; the rules forbid guessing K=1000 or 1024 |
+| official offerings that are documentation stubs | 12 | kept as offerings with availability + notes and no limits/capabilities/pricing |
+| models with no aggregator listing | 4 | they exist via provider documentation only; not dropped |
+| `supported_efforts` list order | 29 representations → 26 sets | stored as a set; the reordering carries no information |
 
 ## Rebuilding
 
 ```bash
-python -m modelmeta update                      # fetch upstream
-python -m modelmeta update --from-file snap.json
-python -m modelmeta update --no-raw             # ~13.8 MB instead of 16.4 MB
+python -m modelmeta update --from-file snapshot/model_metainf_2026-10-03.json
 python -m modelmeta verify
 python -m unittest discover -s tests -t .
 ```
 
-Zero third-party dependencies — Python 3.8+ stdlib only (`sqlite3`, `argparse`,
-`urllib`, `json`). The build is deterministic: the only timestamp is the caller-supplied
-`observed_at`, all iteration is sorted, and all JSON is key-sorted, so rebuilding the
-same input yields a byte-identical file. `verify` asserts this.
+Zero third-party dependencies — Python 3.8+ stdlib only. The build is deterministic: the
+only timestamp is the snapshot's own `snapshot_at`, every iteration is sorted, every JSON
+serialisation is key-sorted, and string lists are stored as sets. Rebuilding the same
+snapshot yields a byte-identical file, which `verify` asserts by rebuilding and comparing.
+
+Reproducibility is keyed on a **content hash** (a canonical serialisation of the document),
+not on the input file's bytes. An earlier iteration hashed raw bytes, so the same data
+arriving as UTF-16+CRLF and as UTF-8+LF produced different databases and the committed file
+could not be reproduced from the documented path. `tests/test_mirror.py` keeps that as a
+regression test.
 
 ## Scope and honest limits
 
-- **`verify` proves completeness, not accuracy.** It checks that nothing was dropped
-  (per-field accounting, exact round-trip) and that the DB is self-consistent
-  (tri-state, band resolution, aliases, determinism). LiteLLM *is* the upstream truth, so
-  there is no higher authority to validate against — if upstream is wrong, this records
-  it faithfully as wrong.
-- **`modelmeta.db` is a ~16 MB binary in git.** SQLite pages delta-compress reasonably
-  between rebuilds, but binaries do not line-diff: no `git blame`, and a PR shows "blob
-  replaced". `ingest_issue` is the reviewable text artifact. History grows by roughly the
-  file size per rebuild; if it passes ~50 MB, move to a GitHub Release asset or LFS.
-- **`ingest_issue` is not decoration.** A price-named field the grammar cannot classify
-  still lands in `fact` as a number and is logged as `unclassified` — "went to `fact`
-  rather than `price`", never "was dropped". Today's snapshot produces 0 of these.
-- The shipped `.db` is `VACUUMed` and in `journal_mode=DELETE`, so it is readable
-  standalone (no `-wal` sidecar needed).
+- **Unverified, as above.** This is the single most important caveat in this document.
+- **This is a curated subset, not a census.** 651 models selected from an aggregator
+  catalogue plus targeted official documentation. The snapshot's own `scope` block lists
+  the selection rule and its `coverage_gaps`; both are queryable in `scope_item`.
+- **`verify` proves the mirror is faithful, not that the metadata is true.** It checks that
+  nothing was dropped, that no tri-state was flattened, that no conflict was resolved and
+  no odd value repaired, and that rebuilds are identical. It cannot check the claims
+  against reality, because nothing here was measured.
+- **The snapshot is committed deliberately.** There is no upstream URL to refetch it from —
+  it is the output of a curation pipeline — so the JSON in the tree is the source of truth
+  and the `.db` is a derived index. Review happens on the JSON; the binary is regenerated.
+  The database is ~2.3 MB and `raw_record` is not stored, precisely because the snapshot
+  itself is now the lossless artifact.
 
 ## Tests
 
-40 unit tests, including the price-name grammar against every awkward real shape and a
-UTF-16LE fixture — the original snapshot in this repo was UTF-16 with a BOM, and a wrong
-encoding guess silently mangles non-ASCII model names instead of raising.
+37 unit tests. They cover, among other things: that a wrong-format snapshot is rejected
+rather than silently mis-ingested; that all four encodings of the same document parse
+identically and build byte-identical databases; that parameter-inferred capabilities never
+report false and declared-modality ones never report null; that the two effort orderings of
+one model collapse to a single set; and that the CLI's negated parameter filter returns
+empty rather than everything.
+
+`tests/fixtures/make_fixture.py` regenerates the fixture and documents why each of its six
+models was chosen.

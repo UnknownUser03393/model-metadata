@@ -1,10 +1,16 @@
-"""Build modelmeta.db from a LiteLLM metadata snapshot.
+"""Mirror the curated snapshot into SQLite.
 
-Determinism is a hard requirement, not a nicety: the .db is committed to git, and a
-rebuild that changed nothing must produce an identical file. Every iteration order is
-sorted, every JSON serialisation is key-sorted, and the only timestamp in the database
-is the caller-supplied ``observed_at`` (never the wall clock), so two builds with the
-same inputs are byte-identical.
+The governing rule is that this loader **does not interpret**. It moves values into typed
+columns, splits sets into rows, and reports anything it does not recognise. It never
+infers a capability, never coerces a NULL to false, never repairs a suspicious token limit
+and never resolves a conflict. If upstream says something strange, the database says the
+same strange thing and `ingest_issue` records that it was seen.
+
+Determinism is a hard requirement: the .db is committed, and a rebuild of unchanged input
+must be byte-identical. Every iteration order is sorted, every JSON serialisation is
+key-sorted, the only timestamp is the snapshot's own `snapshot_at` (never the wall clock),
+and string lists are stored as sets so that upstream's inconsistent list ordering cannot
+change the output.
 """
 
 import hashlib
@@ -12,147 +18,107 @@ import json
 import os
 import sqlite3
 
-from . import DOC_ENTRIES, GENERATOR, SCHEMA_VERSION, SOURCES, SOURCE_ID
-from . import normalize as N
+from . import schema as S
 
 SCHEMA_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql"
 )
 
-LITELLM = SOURCE_ID["litellm"]
 
-FACT_COLUMNS = (
-    "model_id, source_id, field, raw_field, value_type, v_bool, v_num, v_text, v_json, "
-    "is_derived, observed_at"
-)
-
-
-def _dumps(value):
+def dumps(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _value_hash(pairs):
-    return hashlib.sha256(_dumps(sorted(pairs)).encode("utf-8")).hexdigest()
+def canonicalize(obj):
+    """A canonical form: dict keys sorted, lists reduced to a deterministic order.
 
-
-def field_value_hashes(records):
-    """Per-field hash of every (model_key, value) pair.
-
-    Used for freshness carry-forward: an unchanged hash means the field did not change
-    between snapshots, so first_seen/last_changed survive a rebuild.
+    Lists of scalars are sorted, because the snapshot stores set-valued lists
+    (modalities, supported_parameters, supported_efforts) in inconsistent order and the
+    database stores them as sets. Two documents that differ only in such ordering are the
+    same data and must hash alike.
     """
-    by_field = {}
-    for key in sorted(records):
-        rec = records[key]
-        if not isinstance(rec, dict):
-            continue
-        for field in sorted(rec):
-            by_field.setdefault(field, []).append((key, rec[field]))
-    return {f: _value_hash(pairs) for f, pairs in by_field.items()}
+    if isinstance(obj, dict):
+        return {k: canonicalize(obj[k]) for k in sorted(obj)}
+    if isinstance(obj, list):
+        items = [canonicalize(v) for v in obj]
+        if all(isinstance(v, (str, int, float, bool)) or v is None for v in items):
+            return sorted(items, key=lambda v: (v is None, str(v)))
+        return sorted(items, key=dumps)
+    return obj
 
 
-def _read_prior_freshness(path):
-    """Read freshness rows from an existing DB before it is replaced."""
-    if not os.path.exists(path):
-        return {}
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return {}
-    try:
-        rows = conn.execute(
-            "SELECT source_id, field, value_hash, first_seen, last_seen, last_changed "
-            "FROM source_field_freshness"
-        ).fetchall()
-    except sqlite3.Error:
-        return {}
-    finally:
-        conn.close()
-    return {(r[0], r[1]): (r[2], r[3], r[4], r[5]) for r in rows}
+def content_hash(doc):
+    """Hash of what the document *means*, not of its bytes.
 
-
-def _normalize_key(key, provider=None):
-    """Spelling-normalised model name, for grouping spelling variants.
-
-    The leading segment is stripped ONLY when it genuinely is the provider. Stripping it
-    unconditionally collides distinct models: for
-    '512-x-512/50-steps/stability.stable-diffusion-xl-v0' the first segment is a
-    resolution, so it would merge with 'max-x-max/50-steps/...'.
-
-    'deepseek/deepseek-chat' and 'deepseek-chat' both normalise to 'deepseek-chat'.
+    The previous iteration hashed the raw file, so the same data arriving as UTF-16+CRLF
+    and as UTF-8+LF produced different hashes and the committed database could not be
+    reproduced from the documented path. This hash is stable across encoding, indentation
+    and set ordering.
     """
-    parts = key.split("/")
-    if provider and len(parts) > 1 and parts[0] == provider:
-        parts = parts[1:]
-    joined = "-".join(parts)
-    for ch in (".", "_", "/"):
-        joined = joined.replace(ch, "-")
-    return "-".join(p for p in joined.lower().split("-") if p)
+    return hashlib.sha256(dumps(canonicalize(doc)).encode("utf-8")).hexdigest()
 
 
-def _strip_provider_prefix(key, provider):
-    if provider and key.startswith(provider + "/"):
-        return key[len(provider) + 1 :]
-    parts = key.split("/", 1)
-    return parts[1] if len(parts) == 2 else key
+def _as_bool_int(value):
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int) and value in (0, 1):
+        return value
+    return None
 
 
-def _decompose_schedule(model_id, source_id, field, value, issues):
-    """Split a tiered price schedule into banded `price` rows.
+def _as_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    tiered_pricing is a list of {<cost_field>: <number>, "range": [lo, hi]} objects --
-    explicitly banded, so it maps onto `price` perfectly. Decomposing it means
-    price_at() works for models that have *only* a schedule (dashscope/qwen-flash has no
-    flat input_cost_per_token at all). The raw JSON still goes to price_schedule, which
-    remains the authority for the exact band edges.
-    """
-    rows = []
+
+def _as_text(value):
+    return value if isinstance(value, str) else None
+
+
+def _string_set(value):
+    """A set-valued list, order discarded. Non-strings are dropped (and are unusual)."""
     if not isinstance(value, list):
-        return rows
-    for band in value:
-        if not isinstance(band, dict):
-            continue
-        rng = band.get("range")
-        lo = hi = None
-        if isinstance(rng, (list, tuple)) and len(rng) == 2:
-            lo, hi = rng
-        for cost_field in sorted(band):
-            if cost_field == "range" or not N.is_price_named(cost_field):
-                continue
-            price = band[cost_field]
-            if isinstance(price, bool) or not isinstance(price, (int, float)):
-                continue
-            spec = N.parse_price_name(cost_field)
-            if spec is None:
-                issues.append(
-                    ("unclassified", None, cost_field, f"price field inside {field} band not classifiable")
-                )
-                continue
-            rows.append(
-                (
-                    model_id,
-                    source_id,
-                    cost_field,
-                    field,  # origin_field: the schedule this band came from
-                    spec["direction"],
-                    spec["unit"],
-                    spec["modality"],
-                    spec["tier"],
-                    spec["cache_ttl"],
-                    int(lo) if lo is not None else None,
-                    int(hi) if hi is not None else None,
-                    float(price),
-                    spec["qualifier"],
-                )
-            )
-    return rows
+        return []
+    return sorted({v for v in value if isinstance(v, str)})
 
 
-def build(records, out_path, observed_at, source_sha256, origin="", include_raw=True):
+def build(doc, out_path, origin=""):
     """Create the database. Returns (stats, issues)."""
     issues = []
-    prior_freshness = _read_prior_freshness(out_path)
-    hashes = field_value_hashes(records)
+
+    def issue(severity, scope, detail):
+        issues.append((severity, scope, detail))
+
+    # ---- shape drift reporting ---------------------------------------------------
+    for key in sorted(set(doc) - S.KNOWN_TOP_LEVEL):
+        issue("unknown_key", "document", f"unrecognised top-level key {key!r}")
+
+    models = list(doc["models"])
+
+    # Any source referenced anywhere must exist, or the foreign keys fail. A reference to
+    # an undeclared source is a real upstream gap, so it gets a stub row AND an issue
+    # rather than being silently dropped.
+    declared_sources = set(doc.get("sources") or {})
+    referenced = set()
+    for m in models:
+        for group in ("offerings", "official_offerings"):
+            for off in m.get(group) or []:
+                if isinstance(off, dict):
+                    referenced.add(off.get("source_id"))
+                    for s in off.get("additional_source_ids") or []:
+                        referenced.add(s)
+                    pricing = off.get("pricing")
+                    if isinstance(pricing, dict):
+                        referenced.add(pricing.get("source_id"))
+    referenced.discard(None)
+    undeclared = sorted(referenced - declared_sources)
+    for sid in undeclared:
+        issue(
+            "undeclared_source",
+            sid,
+            "referenced by an offering but absent from the snapshot's `sources` map",
+        )
+
+    built_at = _as_text(doc.get("snapshot_at")) or ""
 
     if os.path.exists(out_path):
         os.remove(out_path)
@@ -169,244 +135,383 @@ def build(records, out_path, observed_at, source_sha256, origin="", include_raw=
     conn.execute("PRAGMA synchronous = OFF")
     cur = conn.cursor()
 
-    for sid, name, priority, kind in SOURCES:
+    # ---- document metadata -------------------------------------------------------
+    for key in ("schema_version", "snapshot_at", "as_of_date"):
+        value = doc.get(key)
+        if value is not None:
+            cur.execute("INSERT INTO meta (key, value) VALUES (?,?)", (key, str(value)))
+
+    scope = doc.get("scope") or {}
+    for i, name in enumerate(scope.get("mainstream_author_namespaces") or []):
         cur.execute(
-            "INSERT INTO source (id, name, priority, kind) VALUES (?,?,?,?)",
-            (sid, name, priority, kind),
+            "INSERT INTO scope_item (kind, ordinal, value) VALUES (?,?,?)",
+            ("mainstream_author_namespace", i, name),
+        )
+    for i, text in enumerate(scope.get("coverage_gaps") or []):
+        cur.execute(
+            "INSERT INTO scope_item (kind, ordinal, value) VALUES (?,?,?)",
+            ("coverage_gap", i, text),
         )
 
-    price_fields_seen = set()
-    schedule_fields_seen = set()
-    aliases = {}
-    by_norm = {}
-
-    # No explicit BEGIN: sqlite3's default isolation_level already opens a transaction
-    # before the first INSERT, and executescript() above has committed the DDL.
-    model_id = 0
-    for key in sorted(records):
-        rec = records[key]
-        if not isinstance(rec, dict):
-            issues.append(("drop", key, None, f"record is {type(rec).__name__}, expected object"))
-            continue
-
-        model_id += 1
-        is_doc = 1 if key in DOC_ENTRIES else 0
-        mode_raw = rec.get("mode")
-        mode, mode_issue = N.coerce_mode(mode_raw)
-        if mode_issue:
-            issues.append(("coerce", key, "mode", mode_issue))
-        provider = N.provider_of(rec)
-        dep = rec.get("deprecation_date")
-        if not isinstance(dep, str):
-            dep = None
-
-        # Doc entries carry literal placeholder strings everywhere, so only the key,
-        # provider and mode_raw are meaningful.
-        if is_doc:
-            dep = None
-
+    for name in sorted(doc.get("normalization_rules") or {}):
         cur.execute(
-            "INSERT INTO model (id, key, family_id, mode, mode_raw, provider, is_doc_entry, "
-            "deprecation_date) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO normalization_rule (name, text) VALUES (?,?)",
+            (name, doc["normalization_rules"][name]),
+        )
+
+    for name in sorted(doc.get("statistics") or {}):
+        cur.execute(
+            "INSERT INTO statistic (name, value) VALUES (?,?)",
+            (name, float(doc["statistics"][name])),
+        )
+
+    for sid in sorted(declared_sources):
+        src = doc["sources"][sid] or {}
+        cur.execute(
+            "INSERT INTO source (id, url, kind, retrieved_at, live_http_status) "
+            "VALUES (?,?,?,?,?)",
             (
-                model_id,
-                key,
-                None,
-                mode,
-                mode_raw if isinstance(mode_raw, str) else None,
-                provider,
-                is_doc,
-                dep,
+                sid,
+                _as_text(src.get("url")),
+                _as_text(src.get("kind")) or "unknown",
+                _as_text(src.get("retrieved_at")),
+                _as_int(src.get("live_http_status")),
+            ),
+        )
+    for sid in undeclared:
+        cur.execute(
+            "INSERT INTO source (id, url, kind, retrieved_at, live_http_status) "
+            "VALUES (?,?,?,?,?)",
+            (sid, None, "referenced_but_undeclared", None, None),
+        )
+
+    for namespace in sorted(doc.get("provider_namespace_counts") or {}):
+        cur.execute(
+            "INSERT INTO provider_namespace_count (namespace, n) VALUES (?,?)",
+            (namespace, int(doc["provider_namespace_counts"][namespace])),
+        )
+
+    for i, check in enumerate(doc.get("endpoint_discovery_checks") or []):
+        if not isinstance(check, dict):
+            issue("drop", "endpoint_discovery_checks", f"entry {i} is not an object")
+            continue
+        cur.execute(
+            "INSERT INTO endpoint_discovery_check "
+            "(id, model_id, url, status, response, checked_at, endpoint_count) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                i,
+                _as_text(check.get("model_id")),
+                _as_text(check.get("url")),
+                _as_text(check.get("status")),
+                _as_text(check.get("response")),
+                _as_text(check.get("checked_at")),
+                _as_int(check.get("endpoint_count")),
             ),
         )
 
+    # ---- capability taxonomy (mirrors modelmeta/schema.py) ------------------------
+    for name, domain, aspect, false_ok in S.capability_rows():
         cur.execute(
-            "INSERT INTO provider_offer (model_id, provider, provider_model_id) VALUES (?,?,?)",
-            (model_id, provider or "unknown", _strip_provider_prefix(key, provider)),
+            "INSERT INTO capability_def (name, domain, evidence_aspect, false_is_meaningful) "
+            "VALUES (?,?,?,?)",
+            (name, domain, aspect, false_ok),
         )
 
-        if include_raw:
+    # ---- models and offerings ----------------------------------------------------
+    counts = {"capability": 0, "modality": 0, "price": 0, "conflict": 0}
+    model_id = 0
+    offering_id = 0
+
+    for model in sorted(models, key=lambda m: m["catalog_id"]):
+        catalog_id = model["catalog_id"]
+
+        for key in sorted(set(model) - S.KNOWN_MODEL_KEYS):
+            issue("unknown_key", catalog_id, f"unrecognised model key {key!r}")
+
+        model_id += 1
+        selection = model.get("selection") or {}
+        identity = model.get("model_identity") or {}
+        cur.execute(
+            "INSERT INTO model (id, catalog_id, canonical_slug, name, author, "
+            "mainstream_author, catalog_order, common_candidate, usage_verified, "
+            "hugging_face_id, release_date, catalog_created_at, knowledge_cutoff, "
+            "open_weights, license, parameter_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                model_id,
+                catalog_id,
+                _as_text(model.get("canonical_slug")),
+                model.get("name") or catalog_id,
+                model.get("author") or "unknown",
+                _as_bool_int(selection.get("mainstream_author")),
+                _as_int(selection.get("catalog_order")),
+                _as_bool_int(selection.get("common_candidate")),
+                _as_bool_int(selection.get("usage_verified")),
+                _as_text(identity.get("hugging_face_id")),
+                _as_text(identity.get("release_date")),
+                _as_text(identity.get("catalog_created_at")),
+                _as_text(identity.get("knowledge_cutoff")),
+                _as_bool_int(identity.get("open_weights")),
+                _as_text(identity.get("license")),
+                _as_int(identity.get("parameter_count")),
+            ),
+        )
+
+        for conflict in sorted(
+            (c for c in (model.get("conflicts") or []) if isinstance(c, dict)),
+            key=lambda c: (c.get("field") or "", c.get("source_id") or ""),
+        ):
+            counts["conflict"] += 1
             cur.execute(
-                "INSERT INTO raw_record (model_id, v_json, sha256) VALUES (?,?,?)",
+                "INSERT INTO conflict (model_id, field, official_value_json, "
+                "aggregator_value_json, resolution, source_id) VALUES (?,?,?,?,?,?)",
                 (
                     model_id,
-                    _dumps(rec),
-                    hashlib.sha256(_dumps(rec).encode("utf-8")).hexdigest(),
+                    _as_text(conflict.get("field")) or "unknown",
+                    dumps(conflict.get("official_value")),
+                    dumps(conflict.get("aggregator_value")),
+                    _as_text(conflict.get("resolution")) or "",
+                    _as_text(conflict.get("source_id")),
                 ),
             )
 
-        # ---- facts / prices -------------------------------------------------------
-        for field in sorted(rec):
-            value = rec[field]
-            route = N.route_field(field, value)
+        for authority, group in (
+            ("catalog", "offerings"),
+            ("official", "official_offerings"),
+        ):
+            entries = [o for o in (model.get(group) or []) if isinstance(o, dict)]
+            for off in sorted(
+                entries, key=lambda o: (o.get("provider") or "", o.get("source_id") or "")
+            ):
+                offering_id += 1
 
-            if route == N.ROUTE_SCHEDULE:
-                schedule_fields_seen.add(field)
+                for key in sorted(set(off) - S.KNOWN_OFFERING_KEYS):
+                    issue("unknown_key", catalog_id, f"unrecognised offering key {key!r}")
+
+                availability = off.get("availability") or {}
+                limits = off.get("limits") or {}
+                status = _as_text(availability.get("status"))
+                if status is not None and status not in S.AVAILABILITY_STATUSES:
+                    issue(
+                        "unknown_enum",
+                        catalog_id,
+                        f"availability.status={status!r} is not in the known vocabulary",
+                    )
+
                 cur.execute(
-                    "INSERT INTO price_schedule (model_id, source_id, raw_field, v_json) "
-                    "VALUES (?,?,?,?)",
-                    (model_id, LITELLM, field, _dumps(value)),
-                )
-                if field == "tiered_pricing":
-                    # Decomposed so price_at() works for schedules too; the raw JSON
-                    # above remains the authority for exact band edges.
-                    for row in _decompose_schedule(model_id, LITELLM, field, value, issues):
-                        cur.execute(
-                            "INSERT INTO price (model_id, source_id, raw_field, origin_field, "
-                            "direction, unit, modality, tier, cache_ttl, band_start, band_end, "
-                            "price, qualifier) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            row,
-                        )
-                        price_fields_seen.add(row[2])
-                continue
-
-            if route == N.ROUTE_EFFORT:
-                continue  # owned by reasoning_effort, written below
-
-            if route == N.ROUTE_PRICE:
-                spec = N.parse_price_name(field)
-                # Band semantics: a flat per-token price is the base band (0); the
-                # '_above_200k_tokens' family are surcharge bands sharing that slot.
-                band = spec["band_start"]
-                if band is None and spec["unit"] == "per_token":
-                    band = 0
-                cur.execute(
-                    "INSERT INTO price (model_id, source_id, raw_field, origin_field, "
-                    "direction, unit, modality, tier, cache_ttl, band_start, band_end, "
-                    "price, qualifier) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO offering (id, model_id, authority, provider, "
+                    "provider_model_id, source_id, availability_status, inference_tested, "
+                    "account_access_verified, expiration_date, endpoint_count_observed, "
+                    "context_tokens, max_output_tokens, max_input_tokens, tokenizer, "
+                    "notes, knowledge_cutoff) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        model_id, LITELLM, field, None, spec["direction"], spec["unit"],
-                        spec["modality"], spec["tier"], spec["cache_ttl"], band, None,
-                        float(value), spec["qualifier"],
+                        offering_id,
+                        model_id,
+                        authority,
+                        off.get("provider") or "unknown",
+                        _as_text(off.get("model_id")),
+                        off.get("source_id") or "referenced_but_undeclared",
+                        status,
+                        _as_bool_int(availability.get("inference_tested")),
+                        _as_bool_int(availability.get("account_access_verified")),
+                        _as_text(availability.get("expiration_date")),
+                        _as_int(availability.get("endpoint_count_observed")),
+                        # Stored verbatim, including the 73 zero-valued rows. The snapshot's
+                        # own rule is "do not guess", so deciding that 0 means unknown is
+                        # not this loader's call.
+                        _as_int(limits.get("context_tokens")),
+                        _as_int(limits.get("max_output_tokens")),
+                        _as_int(limits.get("max_input_tokens")),
+                        _as_text(off.get("tokenizer")),
+                        _as_text(off.get("notes")),
+                        _as_text(off.get("knowledge_cutoff")),
                     ),
                 )
-                price_fields_seen.add(field)
-                continue
 
-            if N.is_price_named(field):
-                # ROUTE_FACT for a price-named field means the grammar gave up. Keep the
-                # number in fact so it stays queryable, and record why. Never dropped.
-                issues.append(("unclassified", key, field, "price-named field not classifiable"))
+                for extra in _string_set(off.get("additional_source_ids")):
+                    cur.execute(
+                        "INSERT OR IGNORE INTO offering_source (offering_id, source_id) "
+                        "VALUES (?,?)",
+                        (offering_id, extra),
+                    )
+                for protocol in _string_set(off.get("api_protocols")):
+                    cur.execute(
+                        "INSERT INTO api_protocol (offering_id, protocol) VALUES (?,?)",
+                        (offering_id, protocol),
+                    )
 
-            value_type, v_bool, v_num, v_text, v_json = N.classify(value)
-            cur.execute(
-                f"INSERT INTO fact ({FACT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    model_id, LITELLM, N.normalize_field_name(field), field, value_type,
-                    v_bool, v_num, v_text, v_json, 0, observed_at,
-                ),
-            )
+                # --- capabilities: the identity transform, and nothing else ---
+                caps = off.get("capabilities")
+                if isinstance(caps, dict):
+                    for name in sorted(caps):
+                        if name not in S.CAPABILITY_NAMES:
+                            issue(
+                                "unknown_capability",
+                                catalog_id,
+                                f"capability {name!r} is not in the registry; add it to "
+                                f"modelmeta/schema.py so its false-semantics are declared",
+                            )
+                            continue
+                        value = _as_bool_int(caps[name])
+                        if value == 0 and name not in S.FALSE_IS_MEANINGFUL:
+                            # Upstream changing semantics, not a loader bug. Reported
+                            # loudly rather than accepted, because a consumer reading this
+                            # 0 as a fact would be wrong.
+                            issue(
+                                "false_where_impossible",
+                                catalog_id,
+                                f"{name}=false, but upstream only ever reports true/null "
+                                f"for this capability; the semantics may have changed",
+                            )
+                        counts["capability"] += 1
+                        cur.execute(
+                            "INSERT INTO capability (offering_id, name, value) VALUES (?,?,?)",
+                            (offering_id, name, value),
+                        )
 
-        # ---- derived canonical facts ---------------------------------------------
-        derived, limit_issues = N.normalize_limits(rec, mode)
-        for issue in limit_issues:
-            issues.append(("collision", key, issue[1], issue[2]))
-        for dfield, draw, dtype, db_, dn_, dt_, dj_ in derived:
-            cur.execute(
-                f"INSERT INTO fact ({FACT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (model_id, LITELLM, dfield, draw, dtype, db_, dn_, dt_, dj_, 1, observed_at),
-            )
+                for aspect in sorted(off.get("capability_evidence") or {}):
+                    cur.execute(
+                        "INSERT INTO capability_evidence (offering_id, aspect, text) "
+                        "VALUES (?,?,?)",
+                        (offering_id, aspect, off["capability_evidence"][aspect]),
+                    )
 
-        for level, raw_field, encoding, is_default in N.normalize_efforts(rec):
-            cur.execute(
-                "INSERT OR IGNORE INTO reasoning_effort "
-                "(model_id, level, source_id, raw_field, encoding, is_default) VALUES (?,?,?,?,?,?)",
-                (model_id, level, LITELLM, raw_field, encoding, is_default),
-            )
+                modalities = off.get("modalities") or {}
+                for direction in ("input", "output"):
+                    for modality in _string_set(modalities.get(direction)):
+                        counts["modality"] += 1
+                        cur.execute(
+                            "INSERT INTO modality (offering_id, direction, modality) "
+                            "VALUES (?,?,?)",
+                            (offering_id, direction, modality),
+                        )
 
-        by_norm.setdefault((provider, _normalize_key(key, provider)), []).append(key)
+                for param in _string_set(off.get("supported_parameters")):
+                    cur.execute(
+                        "INSERT INTO supported_parameter (offering_id, parameter) "
+                        "VALUES (?,?)",
+                        (offering_id, param),
+                    )
+                for name in sorted(off.get("default_parameters") or {}):
+                    cur.execute(
+                        "INSERT INTO default_parameter (offering_id, name, value_json) "
+                        "VALUES (?,?,?)",
+                        (offering_id, name, dumps(off["default_parameters"][name])),
+                    )
+                for voice in _string_set(off.get("supported_voices")):
+                    cur.execute(
+                        "INSERT INTO supported_voice (offering_id, voice) VALUES (?,?)",
+                        (offering_id, voice),
+                    )
 
-    # ---- spelling aliases ---------------------------------------------------------
-    # A spelling alias says "these two names are the same model". Grouping is by
-    # (provider, normalised name), never by name alone: 'azure/X' and 'azure_ai/X' are
-    # different offers from different providers, not two spellings of one model, and
-    # recording them as aliases would return one provider's pricing for the other.
-    # Pricing must also be byte-identical. A wrong alias returns a wrong answer, so
-    # every condition here is deliberately conservative.
-    alias_count = 0
-    for norm_key in sorted(by_norm, key=lambda p: (p[0] or "", p[1])):
-        _provider, norm = norm_key
-        group = by_norm[norm_key]
-        if len(group) < 2:
-            continue
-        priced = {
-            key: _dumps(
-                {
-                    f: records[key][f]
-                    for f in sorted(records[key])
-                    if N.is_price_named(f) or f in N.PRICE_SCHEDULE_FIELDS
-                }
-            )
-            for key in group
-        }
-        # Canonical is the most-qualified spelling; ties broken alphabetically so the
-        # choice is deterministic.
-        canonical = sorted(group, key=lambda k: (-len(k), k))[0]
-        canon_price = priced[canonical]
-        same_priced = [k for k in group if priced[k] == canon_price]
+                # --- reasoning: effort set, order discarded ---
+                reasoning = off.get("reasoning")
+                if isinstance(reasoning, dict):
+                    cur.execute(
+                        "INSERT INTO reasoning_profile (offering_id, mandatory, "
+                        "default_enabled, default_effort) VALUES (?,?,?,?)",
+                        (
+                            offering_id,
+                            _as_bool_int(reasoning.get("mandatory")),
+                            _as_bool_int(reasoning.get("default_enabled")),
+                            _as_text(reasoning.get("default_effort")),
+                        ),
+                    )
+                    for effort in _string_set(reasoning.get("supported_efforts")):
+                        cur.execute(
+                            "INSERT INTO reasoning_effort (offering_id, effort) "
+                            "VALUES (?,?)",
+                            (offering_id, effort),
+                        )
 
-        for key in sorted(same_priced):
-            if key != canonical:
-                cur.execute(
-                    "INSERT OR IGNORE INTO model_alias (alias, canonical_model_id) "
-                    "SELECT ?, id FROM model WHERE key = ?",
-                    (key, canonical),
-                )
-                alias_count += cur.rowcount
+                # --- pricing ---
+                pricing = off.get("pricing")
+                if isinstance(pricing, dict):
+                    currency = _as_text(pricing.get("currency")) or "USD"
+                    token_unit = _as_int(pricing.get("token_unit")) or 0
+                    tiers = pricing.get("tiers")
+                    if isinstance(tiers, list):
+                        for tier in tiers:
+                            if not isinstance(tier, dict):
+                                continue
+                            band = _as_text(tier.get("time_band"))
+                            for kind, key in S.PRICE_KINDS.items():
+                                if key not in tier:
+                                    continue
+                                counts["price"] += 1
+                                cur.execute(
+                                    "INSERT INTO price (offering_id, kind, "
+                                    "per_million_tokens, currency, token_unit, time_band, "
+                                    "source_id) VALUES (?,?,?,?,?,?,?)",
+                                    (
+                                        offering_id,
+                                        kind,
+                                        float(tier[key]) if isinstance(tier[key], (int, float))
+                                        and not isinstance(tier[key], bool) else None,
+                                        currency,
+                                        token_unit,
+                                        band,
+                                        _as_text(pricing.get("source_id")),
+                                    ),
+                                )
+                    else:
+                        for kind, key in S.PRICE_KINDS.items():
+                            if key not in pricing:
+                                continue
+                            counts["price"] += 1
+                            value = pricing[key]
+                            cur.execute(
+                                "INSERT INTO price (offering_id, kind, per_million_tokens, "
+                                "currency, token_unit, time_band, source_id) "
+                                "VALUES (?,?,?,?,?,?,?)",
+                                (
+                                    offering_id,
+                                    kind,
+                                    float(value)
+                                    if isinstance(value, (int, float))
+                                    and not isinstance(value, bool)
+                                    else None,
+                                    currency,
+                                    token_unit,
+                                    None,
+                                    _as_text(pricing.get("source_id")),
+                                ),
+                            )
+                    for raw_key in sorted(pricing.get("raw") or {}):
+                        cur.execute(
+                            "INSERT INTO price_raw (offering_id, key, value) VALUES (?,?,?)",
+                            (offering_id, raw_key, str(pricing["raw"][raw_key])),
+                        )
+                    note = _as_text(pricing.get("notes"))
+                    if note:
+                        cur.execute(
+                            "INSERT INTO price_note (offering_id, note) VALUES (?,?)",
+                            (offering_id, note),
+                        )
 
-        # The bare name is the useful alias ('qwen3-max' -> 'qwen/qwen3-max'), but only
-        # when at least two spellings agree and it does not shadow a real model key.
-        if len(same_priced) >= 2 and norm not in records:
-            cur.execute(
-                "INSERT OR IGNORE INTO model_alias (alias, canonical_model_id) "
-                "SELECT ?, id FROM model WHERE key = ?",
-                (norm, canonical),
-            )
-            alias_count += cur.rowcount
-            if cur.rowcount:
-                aliases[norm] = canonical
-
-    # ---- freshness ----------------------------------------------------------------
-    for field in sorted(hashes):
-        h = hashes[field]
-        prior = prior_freshness.get((LITELLM, field))
-        if prior and prior[0] == h:
-            value_hash, first_seen, _last_seen, last_changed = prior
-        else:
-            value_hash, first_seen, last_changed = h, observed_at, observed_at
+    # ---- ledger ------------------------------------------------------------------
+    for severity, scope_key, detail in issues:
         cur.execute(
-            "INSERT INTO source_field_freshness "
-            "(source_id, field, value_hash, first_seen, last_seen, last_changed) VALUES (?,?,?,?,?,?)",
-            (LITELLM, field, value_hash, first_seen, observed_at, last_changed),
+            "INSERT INTO ingest_issue (severity, scope, detail, created_at) VALUES (?,?,?,?)",
+            (severity, scope_key, detail, built_at),
         )
 
-    # ---- ledger -------------------------------------------------------------------
-    for severity, model_key, raw_field, detail in issues:
-        cur.execute(
-            "INSERT INTO ingest_issue (severity, model_key, raw_field, detail, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (severity, model_key, raw_field, detail, observed_at),
-        )
-
-    counts = {
-        "input_entry_count": len(records),
-        "model_count": cur.execute("SELECT COUNT(*) FROM model").fetchone()[0],
-        "doc_entry_count": cur.execute(
-            "SELECT COUNT(*) FROM model WHERE is_doc_entry = 1"
-        ).fetchone()[0],
+    fid = content_hash(doc)
+    stats = {
+        "model_count": model_id,
+        "offering_count": offering_id,
+        **counts,
+        "issue_count": len(issues),
     }
     meta = {
-        "schema_version": str(SCHEMA_VERSION),
-        "generator": GENERATOR,
-        "built_at": observed_at,
-        "source_origin": origin,
-        "source_sha256": source_sha256,
-        "include_raw": "1" if include_raw else "0",
-        **{k: str(v) for k, v in counts.items()},
-        "issue_count": str(len(issues)),
+        "content_sha256": fid,
+        "origin": origin,
+        "generator": S.GENERATOR,
+        "built_at": built_at,
+        **{k: str(v) for k, v in stats.items()},
     }
-    for k in sorted(meta):
-        cur.execute("INSERT INTO meta (key, value) VALUES (?,?)", (k, meta[k]))
+    for key in sorted(meta):
+        cur.execute("INSERT INTO meta (key, value) VALUES (?,?)", (key, meta[key]))
 
     conn.commit()
     conn.execute("PRAGMA journal_mode = DELETE")
@@ -415,12 +520,4 @@ def build(records, out_path, observed_at, source_sha256, origin="", include_raw=
     conn.commit()
     conn.close()
 
-    stats = {
-        **counts,
-        "issue_count": len(issues),
-        "alias_count": alias_count,
-        "price_fields": sorted(price_fields_seen),
-        "schedule_fields": sorted(schedule_fields_seen),
-        "source_sha256": source_sha256,
-    }
     return stats, issues

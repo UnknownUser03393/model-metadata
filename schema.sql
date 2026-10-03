@@ -1,203 +1,305 @@
--- modelmeta schema (v1)
---
--- Contract shared by ingest.py (writes) and query.py / cli.py (reads).
+-- modelmeta schema v2 -- a faithful mirror of the curated model metadata snapshot.
 --
 -- Design notes that are not obvious from the DDL:
 --
---  * fact.field is the CANONICAL name; fact.raw_field is the name as it appears in
---    the source. For almost every field these are identical. They differ only where a
---    rule derives a canonical fact (e.g. max_input_tokens -> context_window). Raw rows
---    carry is_derived=0 and the derived row carries is_derived=1, so a derivation is
---    always auditable and the raw input is never lost.
+--  * This is a MIRROR, not a re-derivation. The snapshot arrives already normalised and
+--    carries its own contract (`normalization_rules`), per-capability evidence, recorded
+--    conflicts and per-offering availability. The loader's only permitted value transform
+--    is the identity: true/false/null -> 1/0/NULL. There is no inference anywhere.
 --
---  * Price fields live ONLY in price/price_schedule, never duplicated into fact:
---    price.price already *is* the fact. The sole exception is a price-named field the
---    grammar cannot classify -- that lands in fact as value_type='num' plus an
---    ingest_issue row. "unclassified" therefore means "went to fact, not price",
---    never "was dropped".
+--  * The unit of truth is an OFFERING, not a model. The same model served by two
+--    providers has different limits and prices, and the snapshot records that rather than
+--    resolving it. `model_capability` aggregates only to answer "does this model support
+--    X at all", and says NULL when no offering declares it.
 --
---  * resolved_fact is the only resolution path. There is exactly one source of truth
---    (fact); the view recomputes the winner per (model, field) on read, so a rebuild
---    can never leave a stale "resolved" row behind.
+--  * capability.value is genuinely tri-state. NULL means "not established", which is not
+--    false. `capability_def.false_is_meaningful` records whether upstream can even say
+--    false for that capability -- for the parameter-inferred ones it structurally cannot,
+--    so a 0 there would be a bug, not a fact.
 --
---  * mode is deliberately NOT CHECK-constrained. Upstream adds modes regularly
---    (guardrail and vector_store are recent); a CHECK would turn a routine upstream
---    release into a hard ingest failure. The vocabulary is validated in Python instead.
+--  * `offering.provider_model_id` is NULL for 12 official offerings that are documentation
+--    stubs (they carry only availability + notes). So the natural key is anchored on the
+--    owning model: (model_id, authority, provider, source_id). Provider+model_id is NOT
+--    unique among the stubs.
+--
+--  * Prices are per MILLION tokens. time_band is NULL for flat pricing and peak/off_peak
+--    for time-of-day tiers -- there are no token-count bands in this dataset, so the v1
+--    price_at() band resolution was deleted rather than carried over.
+--
+--  * `source.live_http_status` NULL means "never probed", which is not the same as
+--    "failed". Only 1 of 12 sources was ever HTTP-checked.
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
--- Build metadata, including the source snapshot hash. Not derived from the clock
--- unless the caller asks for it, so that repeated builds are byte-identical.
-CREATE TABLE meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
+-- ------------------------------------------------------------------ document metadata
+
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- List-valued prose from `scope`, kept in document order where order is meaningful.
+CREATE TABLE scope_item (
+  kind    TEXT NOT NULL,          -- 'mainstream_author_namespace' | 'coverage_gap'
+  ordinal INTEGER NOT NULL,
+  value   TEXT NOT NULL,
+  PRIMARY KEY (kind, ordinal)
 );
 
--- priority defines resolution order:
---   local_override(100) > provider_official(80) > openrouter(60) > litellm(40)
--- Only 'litellm' currently has a loader; the others exist so the resolver and
--- `diff` are correct the moment a second loader is written.
+-- The snapshot's own data contract, quoted verbatim so a consumer can read the rules the
+-- data was built under without leaving the database.
+CREATE TABLE normalization_rule (name TEXT PRIMARY KEY, text TEXT NOT NULL);
+
+CREATE TABLE statistic (name TEXT PRIMARY KEY, value REAL NOT NULL);
+
 CREATE TABLE source (
-  id       INTEGER PRIMARY KEY,
-  name     TEXT NOT NULL UNIQUE,
-  priority INTEGER NOT NULL,
-  kind     TEXT NOT NULL
+  id                TEXT PRIMARY KEY,
+  url               TEXT,
+  kind              TEXT NOT NULL,
+  retrieved_at      TEXT,
+  live_http_status  INTEGER     -- NULL = never probed (distinct from "failed")
 );
 
--- family is a SOFT grouping: populated only on high-confidence matches, because the
--- heuristic will misfire (gpt-4o vs gpt-4o-mini share a prefix). A wrong family costs
--- a missing convenience; a wrong alias returns a wrong answer -- hence the asymmetry.
-CREATE TABLE family (
+CREATE TABLE provider_namespace_count (namespace TEXT PRIMARY KEY, n INTEGER NOT NULL);
+
+CREATE TABLE endpoint_discovery_check (
   id             INTEGER PRIMARY KEY,
-  vendor         TEXT,
-  canonical_name TEXT NOT NULL,
-  confidence     REAL NOT NULL
+  model_id       TEXT,
+  url            TEXT,
+  status         TEXT,
+  response       TEXT,
+  checked_at     TEXT,
+  endpoint_count INTEGER
 );
+
+-- --------------------------------------------------------------- capability taxonomy
+
+-- Makes "false" vs "unknown" self-documenting in SQL. Mirrors modelmeta/schema.py;
+-- a test asserts the two agree.
+CREATE TABLE capability_def (
+  name                 TEXT PRIMARY KEY,
+  domain               TEXT NOT NULL CHECK (domain IN ('modality','parameter','operational')),
+  evidence_aspect      TEXT NOT NULL,
+  false_is_meaningful  INTEGER NOT NULL CHECK (false_is_meaningful IN (0,1))
+);
+
+-- -------------------------------------------------------------------------- models
 
 CREATE TABLE model (
-  id               INTEGER PRIMARY KEY,
-  key              TEXT NOT NULL UNIQUE,   -- source top-level key, e.g. 'dashscope/qwen-flash'
-  family_id        INTEGER REFERENCES family(id),
-  mode             TEXT,                   -- validated in Python, not CHECKed here
-  mode_raw         TEXT,                   -- the dirty upstream value, kept verbatim
-  provider         TEXT,                   -- from litellm_provider
-  is_doc_entry     INTEGER NOT NULL DEFAULT 0,  -- sample_spec / fallback_generalizations
-  deprecation_date TEXT
-);
-
--- A provider offer is the same model family sold through a different route
--- (openrouter vs dashscope) with its own pricing and limits. Kept distinct from
--- model_alias, which only records spelling variants of one canonical model.
-CREATE TABLE provider_offer (
   id                INTEGER PRIMARY KEY,
-  model_id          INTEGER NOT NULL REFERENCES model(id),
-  provider          TEXT NOT NULL,
-  provider_model_id TEXT,
-  UNIQUE (model_id, provider)
+  catalog_id        TEXT NOT NULL UNIQUE,
+  canonical_slug    TEXT,          -- source-declared; 4 records lack it. Not a dedup key.
+  name              TEXT NOT NULL,
+  author            TEXT NOT NULL,
+  mainstream_author INTEGER,
+  catalog_order     INTEGER,
+  common_candidate  INTEGER,
+  usage_verified    INTEGER,
+  hugging_face_id   TEXT,
+  release_date      TEXT,          -- NULL for 100% of the current snapshot
+  catalog_created_at TEXT,
+  knowledge_cutoff  TEXT,
+  open_weights      INTEGER,       -- NULL for 100%
+  license           TEXT,          -- NULL for 100%
+  parameter_count   INTEGER        -- NULL for 100%
 );
 
-CREATE TABLE model_alias (
-  alias              TEXT PRIMARY KEY,
-  canonical_model_id INTEGER NOT NULL REFERENCES model(id)
+-- ------------------------------------------------------------------------ offerings
+
+CREATE TABLE offering (
+  id                      INTEGER PRIMARY KEY,
+  model_id                INTEGER NOT NULL REFERENCES model(id),
+  authority               TEXT NOT NULL CHECK (authority IN ('catalog','official')),
+  provider                TEXT NOT NULL,
+  provider_model_id       TEXT,     -- NULL for the 12 official documentation stubs
+  source_id               TEXT NOT NULL REFERENCES source(id),
+  availability_status     TEXT,     -- see modelmeta.schema.AVAILABILITY_STATUSES
+  inference_tested        INTEGER,  -- 0 for 100% of rows; see the `unverified` view
+  account_access_verified INTEGER,  -- NULL for 12
+  expiration_date         TEXT,
+  endpoint_count_observed INTEGER,
+  context_tokens          INTEGER,  -- 0 appears 73x; stored as-is, never silently nulled
+  max_output_tokens       INTEGER,  -- 0 appears 73x
+  max_input_tokens        INTEGER,  -- NULL for 100% of rows
+  tokenizer               TEXT,
+  notes                   TEXT,
+  knowledge_cutoff        TEXT,
+  UNIQUE (model_id, authority, provider, source_id)
 );
 
--- The lossless spine. Typed columns instead of a single stringly-typed value column so
--- that `supports_vision = 1` is an index seek rather than a string comparison.
-CREATE TABLE fact (
-  id          INTEGER PRIMARY KEY,
-  model_id    INTEGER NOT NULL REFERENCES model(id),
-  source_id   INTEGER NOT NULL REFERENCES source(id),
-  field       TEXT NOT NULL,        -- canonical name
-  raw_field   TEXT NOT NULL,        -- name as it appears in the source
-  value_type  TEXT NOT NULL CHECK (value_type IN ('bool','num','text','json')),
-  v_bool      INTEGER,
-  v_num       REAL,
-  v_text      TEXT,
-  v_json      TEXT,
-  is_derived  INTEGER NOT NULL DEFAULT 0,
-  observed_at TEXT NOT NULL,
-  UNIQUE (model_id, source_id, field, is_derived)
+CREATE TABLE offering_source (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  source_id   TEXT NOT NULL REFERENCES source(id),
+  PRIMARY KEY (offering_id, source_id)
 );
 
--- reasoning effort is dual-encoded upstream with zero overlap today: 301 models use
--- discrete booleans (supports_xhigh_reasoning_effort, ...), 38 use a list
--- (reasoning_effort_levels). Both encodings are merged here so a consumer asking for
--- the supported efforts gets the union without knowing which encoding was used.
--- raw_field is carried so per-field accounting stays exact.
+CREATE TABLE api_protocol (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  protocol    TEXT NOT NULL,
+  PRIMARY KEY (offering_id, protocol)
+);
+
+-- ------------------------------------------------------- capabilities (tri-state)
+
+CREATE TABLE capability (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  name        TEXT NOT NULL REFERENCES capability_def(name),
+  value       INTEGER,   -- 1 = yes, 0 = no, NULL = not established. Never coerce NULL to 0.
+  PRIMARY KEY (offering_id, name)
+);
+
+-- How each capability group was determined, verbatim from the snapshot.
+CREATE TABLE capability_evidence (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  aspect      TEXT NOT NULL,
+  text        TEXT NOT NULL,
+  PRIMARY KEY (offering_id, aspect)
+);
+
+-- Modality sets. Stored per item because the snapshot's list order is inconsistent
+-- (['text','image','video'] and ['image','text','video'] both occur).
+CREATE TABLE modality (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  direction   TEXT NOT NULL CHECK (direction IN ('input','output')),
+  modality    TEXT NOT NULL,
+  PRIMARY KEY (offering_id, direction, modality)
+);
+
+CREATE TABLE supported_parameter (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  parameter   TEXT NOT NULL,
+  PRIMARY KEY (offering_id, parameter)
+);
+
+CREATE TABLE default_parameter (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  name        TEXT NOT NULL,
+  value_json  TEXT NOT NULL,
+  PRIMARY KEY (offering_id, name)
+);
+
+CREATE TABLE supported_voice (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  voice       TEXT NOT NULL,
+  PRIMARY KEY (offering_id, voice)
+);
+
+-- ---------------------------------------------------- reasoning (order-insensitive)
+
+CREATE TABLE reasoning_profile (
+  offering_id     INTEGER PRIMARY KEY REFERENCES offering(id),
+  mandatory       INTEGER,
+  default_enabled INTEGER,
+  default_effort  TEXT
+);
+
+-- One row per supported level. The snapshot has 31 distinct list representations but
+-- only 27 distinct sets -- the difference is pure ordering, which is discarded here.
 CREATE TABLE reasoning_effort (
-  model_id   INTEGER NOT NULL REFERENCES model(id),
-  level      TEXT NOT NULL,
-  source_id  INTEGER NOT NULL REFERENCES source(id),
-  raw_field  TEXT NOT NULL,
-  encoding   TEXT NOT NULL CHECK (encoding IN ('boolean','list')),
-  is_default INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (model_id, level, source_id)
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  effort      TEXT NOT NULL,
+  PRIMARY KEY (offering_id, effort)
 );
 
--- Price dimensions: direction x unit x modality x tier x cache_ttl, with token-range
--- bands. Base price is band_start=0; '_above_200k_tokens' variants are surcharge
--- rows. Deliberately NOT 137 columns.
+-- -------------------------------------------------------------------------- pricing
+
 CREATE TABLE price (
-  id        INTEGER PRIMARY KEY,
-  model_id  INTEGER NOT NULL REFERENCES model(id),
-  source_id INTEGER NOT NULL REFERENCES source(id),
-  raw_field TEXT NOT NULL,
-  -- NULL when the field was named directly (input_cost_per_token). Set to the schedule
-  -- field name (tiered_pricing) when this row was decomposed out of a band list, so
-  -- per-field accounting can attribute the row to its true origin.
-  origin_field TEXT,
-  direction TEXT NOT NULL,   -- input/output/cache_read/cache_creation/search/ocr/annotation/...
-  unit      TEXT NOT NULL,   -- per_token/per_second/per_page/per_image/per_pixel/per_query/...
-  modality  TEXT,            -- audio/image/video/text
-  tier      TEXT,            -- batches/priority/flex/ultrafast/balanced
-  cache_ttl TEXT,            -- '1hr'
-  band_start INTEGER,
-  band_end   INTEGER,
-  price     REAL NOT NULL,
-  qualifier TEXT             -- residual qualifier after known dimensions are stripped;
-                             -- never discarded, so nothing is silently lost
+  offering_id        INTEGER NOT NULL REFERENCES offering(id),
+  kind               TEXT NOT NULL CHECK (kind IN ('input','output','cache_read','cache_write')),
+  per_million_tokens REAL,          -- may be NULL (the snapshot writes null prices)
+  currency           TEXT NOT NULL,
+  token_unit         INTEGER NOT NULL,
+  time_band          TEXT,          -- NULL = flat; 'peak'/'off_peak' for time-of-day tiers
+  -- Only the tiered official offerings declare a per-price source; NULL elsewhere.
+  source_id          TEXT REFERENCES source(id),
+  PRIMARY KEY (offering_id, kind, time_band)
 );
 
--- Price structures that cannot be flattened: tiered_pricing is a list of disjoint
--- token-range bands, off_peak_pricing is a time schedule.
-CREATE TABLE price_schedule (
-  id        INTEGER PRIMARY KEY,
-  model_id  INTEGER NOT NULL REFERENCES model(id),
-  source_id INTEGER NOT NULL REFERENCES source(id),
-  raw_field TEXT NOT NULL,
-  v_json    TEXT NOT NULL
+-- Original string values exactly as published, uninterpreted (e.g. {'prompt':'0.0000003'}).
+CREATE TABLE price_raw (
+  offering_id INTEGER NOT NULL REFERENCES offering(id),
+  key         TEXT NOT NULL,
+  value       TEXT NOT NULL,
+  PRIMARY KEY (offering_id, key)
 );
 
--- Verbatim source record per model: the second, independent losslessness proof
--- (the first being the per-field accounting). Droppable with --no-raw.
-CREATE TABLE raw_record (
-  model_id INTEGER PRIMARY KEY REFERENCES model(id),
-  v_json   TEXT NOT NULL,
-  sha256   TEXT NOT NULL
+CREATE TABLE price_note (
+  offering_id INTEGER PRIMARY KEY REFERENCES offering(id),
+  note        TEXT NOT NULL
 );
 
--- Per-field freshness, so "high priority but 40 days stale" is distinguishable from
--- "low priority but fetched today".
-CREATE TABLE source_field_freshness (
-  source_id    INTEGER NOT NULL REFERENCES source(id),
-  field        TEXT NOT NULL,
-  value_hash   TEXT NOT NULL,
-  first_seen   TEXT NOT NULL,
-  last_seen    TEXT NOT NULL,
-  last_changed TEXT NOT NULL,
-  PRIMARY KEY (source_id, field)
+-- ------------------------------------------------------------------------ conflicts
+
+-- Where the official source and the aggregator disagree. Retained rather than resolved:
+-- the snapshot's own rule is "retain both; values belong to different serving offerings".
+CREATE TABLE conflict (
+  id                  INTEGER PRIMARY KEY,
+  model_id            INTEGER NOT NULL REFERENCES model(id),
+  field               TEXT NOT NULL,
+  official_value_json TEXT,
+  aggregator_value_json TEXT,
+  resolution          TEXT NOT NULL,
+  source_id           TEXT
 );
 
--- Ledger of every drop / coercion / collision / unclassified field.
+-- ------------------------------------------------------------------------ ledger
+
+-- Everything the loader could not place, could not classify, or saw change semantics.
+-- Recognising a key is not the same as understanding it, so this is where the difference
+-- is recorded. A non-empty ledger is not a failure; a *silently* non-empty one would be.
 CREATE TABLE ingest_issue (
   id         INTEGER PRIMARY KEY,
-  severity   TEXT NOT NULL CHECK (severity IN ('drop','coerce','unclassified','collision')),
-  model_key  TEXT,
-  raw_field  TEXT,
+  severity   TEXT NOT NULL,
+  scope      TEXT,
   detail     TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 
--- Winner per (model, field). raw (is_derived=0) beats derived at equal priority, so a
--- genuine upstream max_output_tokens wins over one inferred from max_tokens.
-CREATE VIEW resolved_fact AS
-SELECT model_id, field, raw_field, source_id, value_type, v_bool, v_num, v_text, v_json,
-       is_derived
-FROM (
-  SELECT f.*, ROW_NUMBER() OVER (
-           PARTITION BY f.model_id, f.field
-           ORDER BY s.priority DESC, f.is_derived ASC, f.observed_at DESC
-         ) AS rn
-  FROM fact f JOIN source s ON s.id = f.source_id
-) WHERE rn = 1;
+-- ---------------------------------------------------------------------------- views
 
-CREATE INDEX idx_fact_model_field ON fact (model_id, field);
-CREATE INDEX idx_fact_field_bool  ON fact (field, v_bool);
-CREATE INDEX idx_fact_field_num   ON fact (field, v_num);
-CREATE INDEX idx_fact_raw_field   ON fact (raw_field);
-CREATE INDEX idx_price_lookup     ON price (model_id, direction, unit, band_start);
-CREATE INDEX idx_price_raw_field  ON price (raw_field);
-CREATE INDEX idx_model_mode       ON model (mode);
-CREATE INDEX idx_model_provider   ON model (provider);
-CREATE INDEX idx_offer_provider   ON provider_offer (provider);
-CREATE INDEX idx_issue_severity   ON ingest_issue (severity);
+-- "Does this model support X at all?" aggregated over its offerings.
+-- 1  = at least one offering says yes
+-- 0  = no offering says yes AND at least one offering could have said no
+-- NULL = nobody established it
+CREATE VIEW model_capability AS
+SELECT m.id AS model_id, m.catalog_id, d.name AS capability,
+       CASE
+         WHEN SUM(CASE WHEN c.value = 1 THEN 1 ELSE 0 END) > 0 THEN 1
+         WHEN d.false_is_meaningful = 1
+              AND COUNT(c.value) > 0
+              AND SUM(CASE WHEN c.value = 0 THEN 1 ELSE 0 END) = COUNT(c.value) THEN 0
+         ELSE NULL
+       END AS value
+FROM model m
+CROSS JOIN capability_def d
+LEFT JOIN offering o ON o.model_id = m.id
+LEFT JOIN capability c ON c.offering_id = o.id AND c.name = d.name
+GROUP BY m.id, d.name;
+
+-- Flat (non-tiered) prices, for price filtering and ordering.
+CREATE VIEW offering_price_flat AS
+SELECT offering_id, kind, per_million_tokens, currency, token_unit
+FROM price WHERE time_band IS NULL;
+
+CREATE VIEW expiring_offering AS
+SELECT o.id AS offering_id, m.catalog_id, o.authority, o.provider,
+       o.availability_status, o.expiration_date
+FROM offering o JOIN model m ON m.id = o.model_id
+WHERE o.expiration_date IS NOT NULL;
+
+-- Every row here is unverified by construction. Named so that a consumer cannot
+-- reasonably assume otherwise.
+CREATE VIEW unverified AS
+SELECT o.id AS offering_id, m.catalog_id, o.authority, o.provider,
+       o.availability_status, o.inference_tested, o.account_access_verified
+FROM offering o JOIN model m ON m.id = o.model_id
+WHERE o.inference_tested = 0;
+
+-- --------------------------------------------------------------------------- indexes
+
+CREATE INDEX idx_offering_model     ON offering (model_id);
+CREATE INDEX idx_offering_provider  ON offering (provider);
+CREATE INDEX idx_offering_authority ON offering (authority);
+CREATE INDEX idx_capability_lookup  ON capability (name, value);
+CREATE INDEX idx_modality_lookup    ON modality (direction, modality);
+CREATE INDEX idx_price_lookup       ON price (kind, per_million_tokens);
+CREATE INDEX idx_model_author       ON model (author);
+CREATE INDEX idx_offering_expiry    ON offering (expiration_date)
+  WHERE expiration_date IS NOT NULL;

@@ -8,7 +8,6 @@ __pycache__/
 *.py[cod]
 .venv/
 
-# The upstream snapshot is an input, not an artifact: its content is preserved verbatim
-# in the raw_record table, and `update` can refetch it. Keeping it out of the repo avoids
-# shipping a 6 MB non-diffable UTF-16 file next to the database that supersedes it.
-model_metadata.json
+# The snapshot under snapshot/ IS committed on purpose. Unlike the previous dataset there
+# is no upstream URL to refetch it from -- it is the output of a curation pipeline -- so
+# the JSON in the tree is the source of truth and the database is a derived index.
